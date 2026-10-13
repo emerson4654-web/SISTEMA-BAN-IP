@@ -16,7 +16,6 @@ const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const BAN_API_SECRET = process.env.BAN_API_SECRET;
 
-// Configurações para banir e desbanir no Discord de verdade.
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
 
@@ -676,11 +675,11 @@ app.post('/admin/banir', exigirAdmin, async (req, res) => {
             ]
         );
 
-        res.redirect('/admin');
+        return res.redirect('/admin');
     } catch (erro) {
         console.error('Erro ao banir:', erro);
 
-        res.status(500).send(pagina(
+        return res.status(500).send(pagina(
             'Erro',
             '<div class="card"><h2>Não foi possível banir.</h2><a href="/admin">Voltar</a></div>'
         ));
@@ -688,7 +687,7 @@ app.post('/admin/banir', exigirAdmin, async (req, res) => {
 });
 
 // ======================================
-// DESBANIR PELO PAINEL — CORRIGIDO
+// DESBANIR PELO PAINEL
 // ======================================
 
 app.post('/admin/desbanir', exigirAdmin, async (req, res) => {
@@ -697,7 +696,10 @@ app.post('/admin/desbanir', exigirAdmin, async (req, res) => {
     const discordId = String(req.body.discord_id || '').trim();
 
     if (!/^\d{17,20}$/.test(discordId)) {
-        return res.status(400).send('ID inválido.');
+        return res.status(400).send(pagina(
+            'ID inválido',
+            '<div class="card"><h2>ID do Discord inválido.</h2><a href="/admin">Voltar</a></div>'
+        ));
     }
 
     try {
@@ -707,11 +709,11 @@ app.post('/admin/desbanir', exigirAdmin, async (req, res) => {
         ) {
             return res.status(503).send(pagina(
                 'Configuração necessária',
-                '<div class="card"><h2>Unban não configurado</h2><p>Adicione DISCORD_BOT_TOKEN e DISCORD_GUILD_ID nas variáveis de ambiente do Render. O registro de banimento foi mantido.</p><a href="/admin">Voltar</a></div>'
+                '<div class="card"><h2>Desbanimento não configurado</h2><p>Configure DISCORD_BOT_TOKEN e DISCORD_GUILD_ID nas variáveis de ambiente do Render. Nenhum registro foi removido.</p><a href="/admin">Voltar</a></div>'
             ));
         }
 
-        // Primeiro remove o banimento real do servidor Discord.
+        // Solicita ao Discord que remova o banimento real.
         const resposta = await fetch(
             `https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/bans/${discordId}`,
             {
@@ -722,24 +724,31 @@ app.post('/admin/desbanir', exigirAdmin, async (req, res) => {
             }
         );
 
-        // 204 significa que o Discord retirou o banimento.
-        // 404 significa que a conta não estava banida no Discord.
+        // 204: desbanimento realizado.
+        // 404: o Discord informa que não encontrou esse banimento.
         if (!resposta.ok && resposta.status !== 404) {
             const detalhe = await resposta.text().catch(() => '');
 
             console.error(
-                'Erro no unban do Discord:',
+                'Erro no desbanimento do Discord:',
                 resposta.status,
                 detalhe
             );
 
             return res.status(502).send(pagina(
-                'Falha no unban',
-                `<div class="card"><h2>O Discord não permitiu desbanir.</h2><p>Código retornado: ${resposta.status}.</p><p>Confira o token, o ID do servidor e a permissão Banir membros do bot.</p><a href="/admin">Voltar</a></div>`
+                'Falha no desbanimento',
+                `<div class="card">
+                    <h2>O Discord não permitiu concluir o desbanimento.</h2>
+                    <p>Código de resposta: ${resposta.status}.</p>
+                    <p>Confira se o bot está no servidor correto, se o token está certo e se ele possui a permissão Banir membros.</p>
+                    <p>O registro de banimento do site foi mantido.</p>
+                    <a href="/admin">Voltar ao painel</a>
+                </div>`
             ));
         }
 
-        // Só apaga o registro do site depois da resposta do Discord.
+        // Remove o registro local somente após a resposta aceita do Discord
+        // ou quando o Discord informa que o banimento não foi encontrado.
         await pool.query(
             'DELETE FROM user_bans WHERE discord_id = $1',
             [discordId]
@@ -751,7 +760,7 @@ app.post('/admin/desbanir', exigirAdmin, async (req, res) => {
 
         return res.status(500).send(pagina(
             'Erro',
-            '<div class="card"><h2>Não foi possível concluir o unban.</h2><p>O registro do site foi mantido. Tente novamente.</p><a href="/admin">Voltar</a></div>'
+            '<div class="card"><h2>Não foi possível concluir o desbanimento.</h2><p>O registro do site foi mantido. Tente novamente.</p><a href="/admin">Voltar</a></div>'
         ));
     }
 });
