@@ -1,4 +1,3 @@
-
 'use strict';
 
 const express = require('express');
@@ -223,81 +222,50 @@ function obterIp(req) {
 }
 
 // ======================================
-// ANTI-VPN — IPLOGS
+// VERIFICAÇÃO DE PAÍS — SOMENTE BRASIL
 // ======================================
 
-async function verificarIpLogs(ip) {
+async function verificarPaisBrasil(ip) {
     const ipLimpo = String(ip || '').trim();
 
     if (
         !ipLimpo ||
         ipLimpo === 'desconhecido' ||
         ipLimpo === '::1' ||
-        ipLimpo === '127.0.0.1'
+        ipLimpo === '127.0.0.1' ||
+        /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ipLimpo)
     ) {
-        throw new Error('Não foi possível identificar o IP público.');
+        throw new Error(
+            'Não foi possível identificar o IP público do visitante.'
+        );
     }
 
     const resposta = await fetch(
-        'https://iplogs.com/v1/check',
-        {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                ip: ipLimpo
-            }),
-            signal: AbortSignal.timeout(10000)
-        }
+        `https://ipwho.is/${encodeURIComponent(ipLimpo)}`,
+        { signal: AbortSignal.timeout(10000) }
     );
 
-    // ALTERAÇÃO: registrar a resposta real do IPLogs
-    // para descobrirmos por que a API está retornando erro.
     if (!resposta.ok) {
-        const detalhe = await resposta.text().catch(() => '');
-
-        console.error(
-            'Erro detalhado do IPLogs:',
-            resposta.status,
-            detalhe.slice(0, 1500)
-        );
-
         throw new Error(
-            `IPLogs respondeu com HTTP ${resposta.status}.`
+            `Serviço de localização respondeu com HTTP ${resposta.status}.`
         );
     }
 
     const dados = await resposta.json();
 
     if (
-        typeof dados.is_vpn !== 'boolean' ||
-        typeof dados.score !== 'number' ||
-        typeof dados.verdict !== 'string'
+        dados.success !== true ||
+        typeof dados.country_code !== 'string'
     ) {
-        throw new Error('Resposta inválida do IPLogs.');
+        throw new Error('Não foi possível descobrir o país deste IP.');
     }
 
-    const veredito = dados.verdict.toLowerCase();
-
-    const vereditosBloqueados = [
-        'vpn',
-        'proxy',
-        'tor',
-        'vpn_likely',
-        'vpn-likely'
-    ];
-
-    const bloqueado =
-        dados.is_vpn === true ||
-        dados.score >= 0.5 ||
-        vereditosBloqueados.includes(veredito);
+    const codigoPais = dados.country_code.toUpperCase();
 
     return {
-        bloqueado,
-        verdict: veredito,
-        score: dados.score,
-        tipo: String(dados.ip_info?.type || 'desconhecido')
+        permitido: codigoPais === 'BR',
+        countryCode: codigoPais,
+        country: String(dados.country || codigoPais)
     };
 }
 
@@ -592,7 +560,7 @@ app.get('/auth/callback', async (req, res) => {
 });
 
 // ======================================
-// VERIFICAÇÃO + ANTI-VPN + CARGO
+// VERIFICAÇÃO DE PAÍS + CARGO
 // ======================================
 
 app.get('/verificar', async (req, res) => {
@@ -624,29 +592,30 @@ app.get('/verificar', async (req, res) => {
             ));
         }
 
-        // Consulta o IP do visitante no IPLogs.
-        // Se o serviço falhar, a verificação não é concluída.
-        let resultadoIp;
+        // Verifica somente o país. Não verifica VPN, proxy ou Tor.
+        let resultadoPais;
 
         try {
-            resultadoIp = await verificarIpLogs(ip);
-        } catch (erroIp) {
+            resultadoPais = await verificarPaisBrasil(ip);
+        } catch (erroPais) {
             console.error(
-                'Falha na checagem IPLogs:',
-                erroIp.message
+                'Falha na localização do IP:',
+                erroPais.message
             );
 
             return res.status(503).send(pagina(
                 'Verificação indisponível',
                 `<section class="card">
-                    <h2>⚠️ Não foi possível verificar sua conexão</h2>
-                    <p>O serviço de segurança está temporariamente indisponível.</p>
+                    <h2>⚠️ Não foi possível identificar seu país</h2>
+                    <p>O serviço de localização está indisponível ou não conseguiu identificar seu IP público.</p>
                     <p>Tente novamente em alguns instantes. Seu cargo não foi alterado.</p>
                     <a href="/verificar">Tentar novamente</a>
                     <a class="secondary" href="/">Voltar</a>
                 </section>`
             ));
         }
+
+        const bloqueadoPorPais = !resultadoPais.permitido;
 
         await pool.query(
             `INSERT INTO vpn_checks
@@ -655,33 +624,30 @@ app.get('/verificar', async (req, res) => {
             [
                 usuario.id,
                 ip,
-                resultadoIp.verdict,
-                resultadoIp.score,
-                resultadoIp.bloqueado
+                resultadoPais.countryCode,
+                null,
+                bloqueadoPorPais
             ]
         );
 
-        if (resultadoIp.bloqueado) {
+        if (bloqueadoPorPais) {
             console.warn(
-                `Verificação bloqueada: Discord ${usuario.id}; ` +
-                `veredito=${resultadoIp.verdict}; ` +
-                `score=${resultadoIp.score}`
+                `Acesso bloqueado por país: Discord ${usuario.id}; ` +
+                `país=${resultadoPais.countryCode}`
             );
 
             return res.status(403).send(pagina(
-                'Conexão bloqueada',
+                'Acesso permitido somente no Brasil',
                 `<section class="card">
-                    <h2>🛡️ Verificação não concluída</h2>
-                    <p>A checagem de segurança identificou sinais de VPN, proxy, Tor ou conexão de risco.</p>
-                    <p>Se estiver usando uma VPN ou proxy, desative-a e tente novamente.</p>
-                    <p>Se acredita que houve um engano, entre em contato com a equipe administrativa.</p>
+                    <h2>🇧🇷 Acesso restrito ao Brasil</h2>
+                    <p>O país identificado para sua conexão foi <strong>${escapar(resultadoPais.country)}</strong>.</p>
+                    <p>Este sistema de verificação só permite conexões identificadas como brasileiras.</p>
                     <a href="/">Voltar</a>
                 </section>`
             ));
         }
 
-        // Entrega o cargo somente após a checagem do IP.
-        // Se falhar, não registra a verificação como concluída.
+        // Entrega o cargo após confirmar que o país é o Brasil.
         try {
             await atribuirCargoVerificado(usuario.id);
         } catch (erroCargo) {
@@ -694,7 +660,7 @@ app.get('/verificar', async (req, res) => {
                 'Não foi possível entregar o cargo',
                 `<section class="card">
                     <h2>⚠️ Verificação ainda não concluída</h2>
-                    <p>Sua conexão passou pela checagem, mas o Discord não confirmou a entrega do cargo.</p>
+                    <p>Sua conexão passou pela verificação de país, mas o Discord não confirmou a entrega do cargo.</p>
                     <p>${escapar(erroCargo.message)}</p>
                     <p>Confira se você está no servidor correto e tente novamente.</p>
                     <a href="/verificar">Tentar novamente</a>
@@ -724,7 +690,7 @@ app.get('/verificar', async (req, res) => {
             <section class="card">
                 <h2>✅ Verificação concluída!</h2>
                 <p>Conta Discord: <strong>${escapar(usuario.username)}</strong></p>
-                <p>A checagem de segurança foi concluída e o cargo de verificado foi solicitado ao Discord.</p>
+                <p>Seu país foi identificado como Brasil e o cargo de verificado foi solicitado ao Discord.</p>
                 <p class="small">ID da conta: ${escapar(usuario.id)}</p>
                 <a href="/">Voltar à página inicial</a>
             </section>
@@ -818,7 +784,7 @@ app.get('/admin', exigirAdmin, async (req, res) => {
                 <td>${escapar(c.discord_id)}</td>
                 <td>${escapar(c.ip_address)}</td>
                 <td>${escapar(c.verdict)}</td>
-                <td>${escapar(c.score)}</td>
+                <td>${escapar(c.score ?? '—')}</td>
                 <td>${c.blocked ? 'Bloqueado' : 'Liberado'}</td>
                 <td>${escapar(new Date(c.checked_at).toLocaleString('pt-BR'))}</td>
             </tr>
@@ -865,11 +831,11 @@ app.get('/admin', exigirAdmin, async (req, res) => {
             </section>
 
             <section class="card">
-                <h2>🛡️ Registros do anti-VPN</h2>
+                <h2>🇧🇷 Registros de verificação por país</h2>
                 <div style="overflow-x:auto">
                     <table>
                         <thead><tr>
-                            <th>ID Discord</th><th>IP</th><th>Veredito</th><th>Pontuação</th><th>Resultado</th><th>Data</th>
+                            <th>ID Discord</th><th>IP</th><th>País</th><th>Pontuação</th><th>Resultado</th><th>Data</th>
                         </tr></thead>
                         <tbody>
                             ${linhasChecagens || '<tr><td colspan="6">Nenhuma checagem registrada.</td></tr>'}
