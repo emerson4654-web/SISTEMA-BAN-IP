@@ -1,4 +1,3 @@
-
 'use strict';
 
 const express = require('express');
@@ -18,6 +17,7 @@ const BAN_API_SECRET = process.env.BAN_API_SECRET;
 
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
+const CARGO_VERIFICADO = process.env.CARGO_VERIFICADO;
 
 const ADMIN_IDS = (process.env.ADMIN_DISCORD_IDS || '')
     .split(',')
@@ -95,6 +95,18 @@ async function prepararBanco() {
             reason TEXT NOT NULL DEFAULT 'Sem motivo informado',
             banned_by TEXT NOT NULL,
             banned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS vpn_checks (
+            id BIGSERIAL PRIMARY KEY,
+            discord_id TEXT NOT NULL,
+            ip_address TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            score DOUBLE PRECISION,
+            blocked BOOLEAN NOT NULL,
+            checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
 
@@ -206,7 +218,129 @@ function exigirAdmin(req, res, next) {
 function obterIp(req) {
     return String(
         req.ip || req.socket.remoteAddress || 'desconhecido'
-    ).slice(0, 100);
+    ).replace(/^::ffff:/, '').slice(0, 100);
+}
+
+// ======================================
+// ANTI-VPN — IPLOGS
+// ======================================
+
+async function verificarIpLogs(ip) {
+    const ipLimpo = String(ip || '').trim();
+
+    if (
+        !ipLimpo ||
+        ipLimpo === 'desconhecido' ||
+        ipLimpo === '::1' ||
+        ipLimpo === '127.0.0.1'
+    ) {
+        throw new Error('Não foi possível identificar o IP público.');
+    }
+
+    const resposta = await fetch(
+        'https://iplogs.com/v1/check',
+        {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                ip: ipLimpo
+            }),
+            signal: AbortSignal.timeout(10000)
+        }
+    );
+
+    if (!resposta.ok) {
+        throw new Error(
+            `IPLogs respondeu com HTTP ${resposta.status}.`
+        );
+    }
+
+    const dados = await resposta.json();
+
+    if (
+        typeof dados.is_vpn !== 'boolean' ||
+        typeof dados.score !== 'number' ||
+        typeof dados.verdict !== 'string'
+    ) {
+        throw new Error('Resposta inválida do IPLogs.');
+    }
+
+    const veredito = dados.verdict.toLowerCase();
+
+    const vereditosBloqueados = [
+        'vpn',
+        'proxy',
+        'tor',
+        'vpn_likely',
+        'vpn-likely'
+    ];
+
+    const bloqueado =
+        dados.is_vpn === true ||
+        dados.score >= 0.5 ||
+        vereditosBloqueados.includes(veredito);
+
+    return {
+        bloqueado,
+        verdict: veredito,
+        score: dados.score,
+        tipo: String(dados.ip_info?.type || 'desconhecido')
+    };
+}
+
+// ======================================
+// ENTREGA DO CARGO VERIFICADO
+// ======================================
+
+async function atribuirCargoVerificado(discordId) {
+    if (
+        !DISCORD_BOT_TOKEN ||
+        !/^\d{17,20}$/.test(DISCORD_GUILD_ID || '') ||
+        !/^\d{17,20}$/.test(CARGO_VERIFICADO || '')
+    ) {
+        throw new Error(
+            'Configure DISCORD_BOT_TOKEN, DISCORD_GUILD_ID e CARGO_VERIFICADO.'
+        );
+    }
+
+    const resposta = await fetch(
+        `https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${discordId}/roles/${CARGO_VERIFICADO}`,
+        {
+            method: 'PUT',
+            headers: {
+                Authorization: `Bot ${DISCORD_BOT_TOKEN}`
+            },
+            signal: AbortSignal.timeout(10000)
+        }
+    );
+
+    if (!resposta.ok) {
+        const detalhe = await resposta.text().catch(() => '');
+
+        console.error(
+            'Erro ao atribuir cargo:',
+            resposta.status,
+            detalhe
+        );
+
+        if (resposta.status === 404) {
+            throw new Error(
+                'O usuário ou o cargo não foi encontrado. Confirme se a pessoa está no servidor.'
+            );
+        }
+
+        if (resposta.status === 403) {
+            throw new Error(
+                'O bot não tem permissão para entregar o cargo. Confira Gerenciar Cargos e a hierarquia.'
+            );
+        }
+
+        throw new Error(
+            `O Discord recusou a atribuição do cargo (HTTP ${resposta.status}).`
+        );
+    }
 }
 
 // ======================================
@@ -340,10 +474,15 @@ app.get('/auth/login', (req, res) => {
     const state = crypto.randomBytes(24).toString('hex');
     req.session.oauthState = state;
 
-    const url = new URL('https://discord.com/oauth2/authorize');
+    const url = new URL(
+        'https://discord.com/oauth2/authorize'
+    );
 
     url.searchParams.set('client_id', CLIENT_ID);
-    url.searchParams.set('redirect_uri', `${SITE_URL}/auth/callback`);
+    url.searchParams.set(
+        'redirect_uri',
+        `${SITE_URL}/auth/callback`
+    );
     url.searchParams.set('response_type', 'code');
     url.searchParams.set('scope', 'identify');
     url.searchParams.set('state', state);
@@ -389,7 +528,8 @@ app.get('/auth/callback', async (req, res) => {
                     grant_type: 'authorization_code',
                     code,
                     redirect_uri: `${SITE_URL}/auth/callback`
-                })
+                }),
+                signal: AbortSignal.timeout(10000)
             }
         );
 
@@ -409,7 +549,8 @@ app.get('/auth/callback', async (req, res) => {
             {
                 headers: {
                     Authorization: `Bearer ${tokenData.access_token}`
-                }
+                },
+                signal: AbortSignal.timeout(10000)
             }
         );
 
@@ -440,7 +581,7 @@ app.get('/auth/callback', async (req, res) => {
 });
 
 // ======================================
-// VERIFICAÇÃO
+// VERIFICAÇÃO + ANTI-VPN + CARGO
 // ======================================
 
 app.get('/verificar', async (req, res) => {
@@ -472,6 +613,84 @@ app.get('/verificar', async (req, res) => {
             ));
         }
 
+        // Consulta o IP do visitante no IPLogs.
+        // Se o serviço falhar, a verificação não é concluída.
+        let resultadoIp;
+
+        try {
+            resultadoIp = await verificarIpLogs(ip);
+        } catch (erroIp) {
+            console.error(
+                'Falha na checagem IPLogs:',
+                erroIp.message
+            );
+
+            return res.status(503).send(pagina(
+                'Verificação indisponível',
+                `<section class="card">
+                    <h2>⚠️ Não foi possível verificar sua conexão</h2>
+                    <p>O serviço de segurança está temporariamente indisponível.</p>
+                    <p>Tente novamente em alguns instantes. Seu cargo não foi alterado.</p>
+                    <a href="/verificar">Tentar novamente</a>
+                    <a class="secondary" href="/">Voltar</a>
+                </section>`
+            ));
+        }
+
+        await pool.query(
+            `INSERT INTO vpn_checks
+                (discord_id, ip_address, verdict, score, blocked)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+                usuario.id,
+                ip,
+                resultadoIp.verdict,
+                resultadoIp.score,
+                resultadoIp.bloqueado
+            ]
+        );
+
+        if (resultadoIp.bloqueado) {
+            console.warn(
+                `Verificação bloqueada: Discord ${usuario.id}; ` +
+                `veredito=${resultadoIp.verdict}; ` +
+                `score=${resultadoIp.score}`
+            );
+
+            return res.status(403).send(pagina(
+                'Conexão bloqueada',
+                `<section class="card">
+                    <h2>🛡️ Verificação não concluída</h2>
+                    <p>A checagem de segurança identificou sinais de VPN, proxy, Tor ou conexão de risco.</p>
+                    <p>Se estiver usando uma VPN ou proxy, desative-a e tente novamente.</p>
+                    <p>Se acredita que houve um engano, entre em contato com a equipe administrativa.</p>
+                    <a href="/">Voltar</a>
+                </section>`
+            ));
+        }
+
+        // Entrega o cargo somente após a checagem do IP.
+        // Se falhar, não registra a verificação como concluída.
+        try {
+            await atribuirCargoVerificado(usuario.id);
+        } catch (erroCargo) {
+            console.error(
+                'Falha ao entregar cargo:',
+                erroCargo.message
+            );
+
+            return res.status(502).send(pagina(
+                'Não foi possível entregar o cargo',
+                `<section class="card">
+                    <h2>⚠️ Verificação ainda não concluída</h2>
+                    <p>Sua conexão passou pela checagem, mas o Discord não confirmou a entrega do cargo.</p>
+                    <p>${escapar(erroCargo.message)}</p>
+                    <p>Confira se você está no servidor correto e tente novamente.</p>
+                    <a href="/verificar">Tentar novamente</a>
+                </section>`
+            ));
+        }
+
         await pool.query(
             `INSERT INTO verified_users
                 (discord_id, username, avatar, ip_address, verified_at)
@@ -490,11 +709,11 @@ app.get('/verificar', async (req, res) => {
             ]
         );
 
-        res.send(pagina('Verificação concluída', `
+        return res.send(pagina('Verificação concluída', `
             <section class="card">
-                <h2>✅ Verificação concluída</h2>
+                <h2>✅ Verificação concluída!</h2>
                 <p>Conta Discord: <strong>${escapar(usuario.username)}</strong></p>
-                <p>Seu registro foi salvo. Agora você pode voltar ao Discord.</p>
+                <p>A checagem de segurança foi concluída e o cargo de verificado foi solicitado ao Discord.</p>
                 <p class="small">ID da conta: ${escapar(usuario.id)}</p>
                 <a href="/">Voltar à página inicial</a>
             </section>
@@ -502,9 +721,9 @@ app.get('/verificar', async (req, res) => {
     } catch (erro) {
         console.error('Erro ao verificar:', erro);
 
-        res.status(500).send(pagina(
+        return res.status(500).send(pagina(
             'Erro',
-            '<div class="card"><h2>Não foi possível concluir</h2><p>Tente novamente mais tarde.</p></div>'
+            '<div class="card"><h2>Não foi possível concluir</h2><p>Tente novamente mais tarde.</p><a href="/">Voltar</a></div>'
         ));
     }
 });
@@ -516,7 +735,9 @@ app.get('/verificar', async (req, res) => {
 app.get('/admin', exigirAdmin, async (req, res) => {
     try {
         const csrf = gerarCsrf(req);
-        const busca = String(req.query.q || '').trim().slice(0, 100);
+        const busca = String(req.query.q || '')
+            .trim()
+            .slice(0, 100);
 
         let usuarios;
 
@@ -574,6 +795,24 @@ app.get('/admin', exigirAdmin, async (req, res) => {
             </tr>
         `).join('');
 
+        const checagens = await pool.query(
+            `SELECT discord_id, ip_address, verdict, score, blocked, checked_at
+             FROM vpn_checks
+             ORDER BY checked_at DESC
+             LIMIT 50`
+        );
+
+        const linhasChecagens = checagens.rows.map(c => `
+            <tr>
+                <td>${escapar(c.discord_id)}</td>
+                <td>${escapar(c.ip_address)}</td>
+                <td>${escapar(c.verdict)}</td>
+                <td>${escapar(c.score)}</td>
+                <td>${c.blocked ? 'Bloqueado' : 'Liberado'}</td>
+                <td>${escapar(new Date(c.checked_at).toLocaleString('pt-BR'))}</td>
+            </tr>
+        `).join('');
+
         res.send(pagina('Painel administrativo', `
             <section class="card">
                 <h2>🔐 Painel administrativo</h2>
@@ -583,7 +822,7 @@ app.get('/admin', exigirAdmin, async (req, res) => {
                     <input name="q" value="${escapar(busca)}" placeholder="Nome ou ID">
                     <button class="button" type="submit">Pesquisar</button>
                 </form>
-                <p class="small">Exibindo no máximo 100 registros por lista.</p>
+                <p class="small">Exibindo no máximo 100 usuários e 100 banimentos.</p>
             </section>
 
             <section class="card">
@@ -612,6 +851,21 @@ app.get('/admin', exigirAdmin, async (req, res) => {
                         </tbody>
                     </table>
                 </div>
+            </section>
+
+            <section class="card">
+                <h2>🛡️ Registros do anti-VPN</h2>
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead><tr>
+                            <th>ID Discord</th><th>IP</th><th>Veredito</th><th>Pontuação</th><th>Resultado</th><th>Data</th>
+                        </tr></thead>
+                        <tbody>
+                            ${linhasChecagens || '<tr><td colspan="6">Nenhuma checagem registrada.</td></tr>'}
+                        </tbody>
+                    </table>
+                </div>
+                <p class="small">Os registros contêm dados de conexão; restrinja o acesso ao painel a administradores autorizados.</p>
             </section>
 
             <a class="secondary" href="/auth/sair">Sair</a>
@@ -709,23 +963,21 @@ app.post('/admin/desbanir', exigirAdmin, async (req, res) => {
         ) {
             return res.status(503).send(pagina(
                 'Configuração necessária',
-                '<div class="card"><h2>Desbanimento não configurado</h2><p>Configure DISCORD_BOT_TOKEN e DISCORD_GUILD_ID nas variáveis de ambiente do Render. Nenhum registro foi removido.</p><a href="/admin">Voltar</a></div>'
+                '<div class="card"><h2>Desbanimento não configurado</h2><p>Configure DISCORD_BOT_TOKEN e DISCORD_GUILD_ID nas variáveis de ambiente. Nenhum registro foi removido.</p><a href="/admin">Voltar</a></div>'
             ));
         }
 
-        // Solicita ao Discord que remova o banimento real.
         const resposta = await fetch(
             `https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/bans/${discordId}`,
             {
                 method: 'DELETE',
                 headers: {
                     Authorization: `Bot ${DISCORD_BOT_TOKEN}`
-                }
+                },
+                signal: AbortSignal.timeout(10000)
             }
         );
 
-        // 204: desbanimento realizado.
-        // 404: o Discord informa que não encontrou esse banimento.
         if (!resposta.ok && resposta.status !== 404) {
             const detalhe = await resposta.text().catch(() => '');
 
@@ -740,15 +992,13 @@ app.post('/admin/desbanir', exigirAdmin, async (req, res) => {
                 `<div class="card">
                     <h2>O Discord não permitiu concluir o desbanimento.</h2>
                     <p>Código de resposta: ${resposta.status}.</p>
-                    <p>Confira se o bot está no servidor correto, se o token está certo e se ele possui a permissão Banir membros.</p>
+                    <p>Confira o token, o servidor e as permissões do bot.</p>
                     <p>O registro de banimento do site foi mantido.</p>
                     <a href="/admin">Voltar ao painel</a>
                 </div>`
             ));
         }
 
-        // Remove o registro local somente após a resposta aceita do Discord
-        // ou quando o Discord informa que o banimento não foi encontrado.
         await pool.query(
             'DELETE FROM user_bans WHERE discord_id = $1',
             [discordId]
@@ -777,6 +1027,23 @@ app.get('/auth/sair', (req, res) => {
 });
 
 // ======================================
+// TRATAMENTO DE ERROS
+// ======================================
+
+app.use((erro, req, res, next) => {
+    console.error('Erro não tratado na rota:', erro);
+
+    if (res.headersSent) {
+        return next(erro);
+    }
+
+    return res.status(500).send(pagina(
+        'Erro',
+        '<div class="card"><h2>Erro interno</h2><p>Tente novamente mais tarde.</p><a href="/">Voltar</a></div>'
+    ));
+});
+
+// ======================================
 // INICIAR SITE
 // ======================================
 
@@ -787,6 +1054,10 @@ prepararBanco()
         });
     })
     .catch(erro => {
-        console.error('Não foi possível preparar o banco:', erro);
+        console.error(
+            'Não foi possível preparar o banco:',
+            erro
+        );
+
         process.exit(1);
     });
