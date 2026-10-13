@@ -1,3 +1,4 @@
+
 'use strict';
 
 const express = require('express');
@@ -14,6 +15,10 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const BAN_API_SECRET = process.env.BAN_API_SECRET;
+
+// Configurações para banir e desbanir no Discord de verdade.
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
 
 const ADMIN_IDS = (process.env.ADMIN_DISCORD_IDS || '')
     .split(',')
@@ -135,8 +140,6 @@ label{display:block;color:#e5e7eb}
 table{width:100%;border-collapse:collapse}
 th,td{text-align:left;padding:10px;border-bottom:1px solid #343b4a;overflow-wrap:anywhere}
 .small{font-size:13px;color:#aeb6c5}
-.notice{border-left:4px solid #eab308;padding:12px;background:#292719}
-.actions{display:flex;gap:8px;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -159,18 +162,13 @@ function validarCsrf(req, res) {
     const salvo = req.session.csrfToken;
 
     if (
-        !enviado ||
-        !salvo ||
         typeof enviado !== 'string' ||
         typeof salvo !== 'string'
     ) {
-        res.status(403).send(
-            pagina(
-                'Acesso recusado',
-                '<div class="card"><h2>Solicitação inválida</h2><p>Atualize a página e tente novamente.</p><a href="/">Voltar</a></div>'
-            )
-        );
-
+        res.status(403).send(pagina(
+            'Acesso recusado',
+            '<div class="card"><h2>Solicitação inválida</h2><p>Atualize a página e tente novamente.</p><a href="/">Voltar</a></div>'
+        ));
         return false;
     }
 
@@ -181,13 +179,10 @@ function validarCsrf(req, res) {
         a.length !== b.length ||
         !crypto.timingSafeEqual(a, b)
     ) {
-        res.status(403).send(
-            pagina(
-                'Acesso recusado',
-                '<div class="card"><h2>Solicitação inválida</h2><p>Atualize a página e tente novamente.</p><a href="/">Voltar</a></div>'
-            )
-        );
-
+        res.status(403).send(pagina(
+            'Acesso recusado',
+            '<div class="card"><h2>Solicitação inválida</h2><p>Atualize a página e tente novamente.</p><a href="/">Voltar</a></div>'
+        ));
         return false;
     }
 
@@ -200,12 +195,10 @@ function exigirAdmin(req, res, next) {
     }
 
     if (!ADMIN_IDS.includes(req.session.usuario.id)) {
-        return res.status(403).send(
-            pagina(
-                'Acesso negado',
-                '<div class="card"><h2>Acesso negado</h2><p>Sua conta não está autorizada a acessar o painel administrativo.</p><a href="/">Voltar</a></div>'
-            )
-        );
+        return res.status(403).send(pagina(
+            'Acesso negado',
+            '<div class="card"><h2>Acesso negado</h2><p>Sua conta não está autorizada a acessar o painel administrativo.</p><a href="/">Voltar</a></div>'
+        ));
     }
 
     next();
@@ -218,7 +211,7 @@ function obterIp(req) {
 }
 
 // ======================================
-// API DE BANIMENTO DO BOT
+// API DE BANIMENTO DO SITE
 // ======================================
 
 app.post('/api/ban', async (req, res) => {
@@ -226,7 +219,7 @@ app.post('/api/ban', async (req, res) => {
         if (!BAN_API_SECRET) {
             return res.status(503).json({
                 success: false,
-                error: 'API de banimento não configurada no site.'
+                error: 'API de banimento não configurada.'
             });
         }
 
@@ -237,15 +230,12 @@ app.post('/api/ban', async (req, res) => {
             ? authorization.slice(prefix.length)
             : '';
 
-        const chaveEsperada = Buffer.from(BAN_API_SECRET);
-        const chaveInformada = Buffer.from(chaveRecebida);
+        const esperada = Buffer.from(BAN_API_SECRET);
+        const recebida = Buffer.from(chaveRecebida);
 
         if (
-            chaveInformada.length !== chaveEsperada.length ||
-            !crypto.timingSafeEqual(
-                chaveInformada,
-                chaveEsperada
-            )
+            recebida.length !== esperada.length ||
+            !crypto.timingSafeEqual(recebida, esperada)
         ) {
             return res.status(401).json({
                 success: false,
@@ -253,21 +243,12 @@ app.post('/api/ban', async (req, res) => {
             });
         }
 
-        const discordId = String(
-            req.body.discord_id || ''
-        ).trim();
-
-        const usernameInformado = String(
-            req.body.username || ''
-        ).trim().slice(0, 100);
-
-        const motivo = String(
-            req.body.reason || ''
-        ).trim().slice(0, 500);
-
-        const responsavel = String(
-            req.body.banned_by || ''
-        ).trim();
+        const discordId = String(req.body.discord_id || '').trim();
+        const usernameInformado = String(req.body.username || '')
+            .trim().slice(0, 100);
+        const motivo = String(req.body.reason || '')
+            .trim().slice(0, 500);
+        const responsavel = String(req.body.banned_by || '').trim();
 
         if (
             !/^\d{17,20}$/.test(discordId) ||
@@ -290,21 +271,9 @@ app.post('/api/ban', async (req, res) => {
 
         const verificado = consulta.rows[0] || null;
 
-        const ipRegistrado = Boolean(
-            verificado?.ip_address
-        );
-
-        const nomeFinal =
-            verificado?.username || usernameInformado;
-
-        const ipFinal = ipRegistrado
-            ? verificado.ip_address
-            : '';
-
         await pool.query(
             `INSERT INTO user_bans
-                (discord_id, username, ip_address,
-                 reason, banned_by, banned_at)
+                (discord_id, username, ip_address, reason, banned_by, banned_at)
              VALUES ($1, $2, $3, $4, $5, NOW())
              ON CONFLICT (discord_id)
              DO UPDATE SET
@@ -315,20 +284,16 @@ app.post('/api/ban', async (req, res) => {
                 banned_at = NOW()`,
             [
                 discordId,
-                nomeFinal,
-                ipFinal,
+                verificado?.username || usernameInformado,
+                verificado?.ip_address || '',
                 motivo,
                 responsavel
             ]
         );
 
-        console.log(
-            `Banimento registrado para Discord ID ${discordId}.`
-        );
-
-        return res.status(200).json({
+        return res.json({
             success: true,
-            ip_registered: ipRegistrado
+            ip_registered: Boolean(verificado?.ip_address)
         });
     } catch (erro) {
         console.error('Erro na API /api/ban:', erro);
@@ -351,42 +316,35 @@ app.get('/', (req, res) => {
         ? `<p>Conectado como <strong>${escapar(usuario.username)}</strong>.</p>
            <a href="/verificar">Concluir verificação</a>
            <a class="secondary" href="/auth/sair">Sair</a>`
-        : `<a href="/auth/login">Entrar com Discord</a>`;
+        : '<a href="/auth/login">Entrar com Discord</a>';
 
     res.send(pagina('Verificação', `
         <section class="card">
             <h2>🛡️ Verificação de conta</h2>
-            <p>Entre com sua conta do Discord para iniciar a verificação do servidor.</p>
+            <p>Entre com sua conta do Discord para iniciar a verificação.</p>
             ${conta}
         </section>
-
         <section class="card">
             <h2>🔒 Aviso de privacidade</h2>
-            <p>Ao continuar, o site recebe seu identificador e nome público do Discord. Para segurança e prevenção de abusos, também registra o endereço IP da conexão e a data da verificação.</p>
-            <p>Esses dados são usados para administrar verificações e investigar possíveis tentativas de contornar banimentos. O acesso aos registros é limitado aos administradores autorizados.</p>
-            <p>Um endereço IP pode ser compartilhado por várias pessoas ou mudar com o tempo. Uma correspondência de IP deve ser analisada com cuidado e não é prova isolada de que as contas pertencem à mesma pessoa.</p>
-            <p class="small">Não informe sua senha do Discord neste site. A autenticação acontece nas páginas oficiais do Discord.</p>
+            <p>O site registra o identificador público da conta, nome, IP da conexão e data de verificação para segurança e prevenção de abusos.</p>
+            <p>Um IP pode ser compartilhado por várias pessoas ou mudar com o tempo. Uma correspondência de IP, isoladamente, não prova que as contas pertencem à mesma pessoa.</p>
+            <p class="small">Nunca informe sua senha do Discord neste site. O login acontece nas páginas oficiais do Discord.</p>
         </section>
     `));
 });
 
 // ======================================
-// LOGIN OFICIAL DISCORD / OAUTH2
+// LOGIN DISCORD / OAUTH2
 // ======================================
 
 app.get('/auth/login', (req, res) => {
     const state = crypto.randomBytes(24).toString('hex');
     req.session.oauthState = state;
 
-    const url = new URL(
-        'https://discord.com/oauth2/authorize'
-    );
+    const url = new URL('https://discord.com/oauth2/authorize');
 
     url.searchParams.set('client_id', CLIENT_ID);
-    url.searchParams.set(
-        'redirect_uri',
-        `${SITE_URL}/auth/callback`
-    );
+    url.searchParams.set('redirect_uri', `${SITE_URL}/auth/callback`);
     url.searchParams.set('response_type', 'code');
     url.searchParams.set('scope', 'identify');
     url.searchParams.set('state', state);
@@ -399,12 +357,10 @@ app.get('/auth/callback', async (req, res) => {
         const { code, state, error } = req.query;
 
         if (error) {
-            return res.status(400).send(
-                pagina(
-                    'Login cancelado',
-                    '<div class="card"><h2>Login cancelado</h2><p>Você não autorizou o login.</p><a href="/">Voltar</a></div>'
-                )
-            );
+            return res.status(400).send(pagina(
+                'Login cancelado',
+                '<div class="card"><h2>Login cancelado</h2><p>Você não autorizou o login.</p><a href="/">Voltar</a></div>'
+            ));
         }
 
         if (
@@ -413,12 +369,10 @@ app.get('/auth/callback', async (req, res) => {
             state !== req.session.oauthState ||
             typeof code !== 'string'
         ) {
-            return res.status(400).send(
-                pagina(
-                    'Erro de autenticação',
-                    '<div class="card"><h2>Não foi possível confirmar o login</h2><p>Volte à página inicial e tente novamente.</p><a href="/">Voltar</a></div>'
-                )
-            );
+            return res.status(400).send(pagina(
+                'Erro de autenticação',
+                '<div class="card"><h2>Não foi possível confirmar o login</h2><a href="/">Voltar</a></div>'
+            ));
         }
 
         delete req.session.oauthState;
@@ -428,8 +382,7 @@ app.get('/auth/callback', async (req, res) => {
             {
                 method: 'POST',
                 headers: {
-                    'Content-Type':
-                        'application/x-www-form-urlencoded'
+                    'Content-Type': 'application/x-www-form-urlencoded'
                 },
                 body: new URLSearchParams({
                     client_id: CLIENT_ID,
@@ -443,26 +396,20 @@ app.get('/auth/callback', async (req, res) => {
 
         const tokenData = await tokenResponse.json();
 
-        if (
-            !tokenResponse.ok ||
-            !tokenData.access_token
-        ) {
+        if (!tokenResponse.ok || !tokenData.access_token) {
             console.error('Falha OAuth:', tokenData);
 
-            return res.status(401).send(
-                pagina(
-                    'Erro de login',
-                    '<div class="card"><h2>Não foi possível entrar</h2><p>Tente novamente.</p><a href="/">Voltar</a></div>'
-                )
-            );
+            return res.status(401).send(pagina(
+                'Erro de login',
+                '<div class="card"><h2>Não foi possível entrar</h2><a href="/">Voltar</a></div>'
+            ));
         }
 
         const userResponse = await fetch(
             'https://discord.com/api/v10/users/@me',
             {
                 headers: {
-                    Authorization:
-                        `Bearer ${tokenData.access_token}`
+                    Authorization: `Bearer ${tokenData.access_token}`
                 }
             }
         );
@@ -470,12 +417,10 @@ app.get('/auth/callback', async (req, res) => {
         const usuario = await userResponse.json();
 
         if (!userResponse.ok || !usuario.id) {
-            return res.status(401).send(
-                pagina(
-                    'Erro de login',
-                    '<div class="card"><h2>Não foi possível obter sua conta do Discord.</h2><a href="/">Voltar</a></div>'
-                )
-            );
+            return res.status(401).send(pagina(
+                'Erro de login',
+                '<div class="card"><h2>Não foi possível obter sua conta.</h2><a href="/">Voltar</a></div>'
+            ));
         }
 
         req.session.usuario = {
@@ -488,17 +433,15 @@ app.get('/auth/callback', async (req, res) => {
     } catch (erro) {
         console.error('Erro no login:', erro);
 
-        res.status(500).send(
-            pagina(
-                'Erro',
-                '<div class="card"><h2>Erro no login</h2><p>Tente novamente mais tarde.</p><a href="/">Voltar</a></div>'
-            )
-        );
+        return res.status(500).send(pagina(
+            'Erro',
+            '<div class="card"><h2>Erro no login</h2><p>Tente novamente mais tarde.</p><a href="/">Voltar</a></div>'
+        ));
     }
 });
 
 // ======================================
-// CONCLUIR VERIFICAÇÃO
+// VERIFICAÇÃO
 // ======================================
 
 app.get('/verificar', async (req, res) => {
@@ -510,11 +453,6 @@ app.get('/verificar', async (req, res) => {
     const ip = obterIp(req);
 
     try {
-        // CORREÇÃO:
-        // Verifica o banimento somente pelo ID da conta Discord.
-        // Não bloqueia uma conta apenas porque compartilha um IP
-        // com outra conta banida.
-
         const banPorId = await pool.query(
             `SELECT discord_id
              FROM user_bans
@@ -524,20 +462,17 @@ app.get('/verificar', async (req, res) => {
         );
 
         if (banPorId.rowCount > 0) {
-            return res.status(403).send(
-                pagina(
-                    'Verificação bloqueada',
-                    `<section class="card">
-                        <h2>⛔ Verificação bloqueada</h2>
-                        <p>Esta conta está banida do sistema de verificação.</p>
-                        <p>Se você acredita que isso é um erro, entre em contato com a equipe administrativa.</p>
-                        <a href="/">Voltar</a>
-                    </section>`
-                )
-            );
+            return res.status(403).send(pagina(
+                'Verificação bloqueada',
+                `<section class="card">
+                    <h2>⛔ Verificação bloqueada</h2>
+                    <p>Esta conta está banida do sistema de verificação.</p>
+                    <p>Se acredita que isso é um erro, entre em contato com a equipe administrativa.</p>
+                    <a href="/">Voltar</a>
+                </section>`
+            ));
         }
 
-        // Conta não banida: registra ou atualiza a verificação.
         await pool.query(
             `INSERT INTO verified_users
                 (discord_id, username, avatar, ip_address, verified_at)
@@ -568,12 +503,10 @@ app.get('/verificar', async (req, res) => {
     } catch (erro) {
         console.error('Erro ao verificar:', erro);
 
-        res.status(500).send(
-            pagina(
-                'Erro',
-                '<div class="card"><h2>Não foi possível concluir</h2><p>Tente novamente mais tarde.</p></div>'
-            )
-        );
+        res.status(500).send(pagina(
+            'Erro',
+            '<div class="card"><h2>Não foi possível concluir</h2><p>Tente novamente mais tarde.</p></div>'
+        ));
     }
 });
 
@@ -584,10 +517,7 @@ app.get('/verificar', async (req, res) => {
 app.get('/admin', exigirAdmin, async (req, res) => {
     try {
         const csrf = gerarCsrf(req);
-
-        const busca = String(req.query.q || '')
-            .trim()
-            .slice(0, 100);
+        const busca = String(req.query.q || '').trim().slice(0, 100);
 
         let usuarios;
 
@@ -621,7 +551,6 @@ app.get('/admin', exigirAdmin, async (req, res) => {
                         <input type="hidden" name="csrfToken" value="${csrf}">
                         <input type="hidden" name="discord_id" value="${escapar(u.discord_id)}">
                         <input type="hidden" name="username" value="${escapar(u.username)}">
-                        <input type="hidden" name="ip_address" value="${escapar(u.ip_address)}">
                         <input name="reason" placeholder="Motivo do banimento" required maxlength="300">
                         <button class="button danger" type="submit">Banir</button>
                     </form>
@@ -650,31 +579,21 @@ app.get('/admin', exigirAdmin, async (req, res) => {
             <section class="card">
                 <h2>🔐 Painel administrativo</h2>
                 <p>Administrador: ${escapar(req.session.usuario.username)}</p>
-
                 <form method="GET" action="/admin">
                     <label>Pesquisar por nome ou ID do Discord</label>
                     <input name="q" value="${escapar(busca)}" placeholder="Nome ou ID">
                     <button class="button" type="submit">Pesquisar</button>
                 </form>
-
                 <p class="small">Exibindo no máximo 100 registros por lista.</p>
             </section>
 
             <section class="card">
                 <h2>Usuários verificados</h2>
-                <p class="small">Consulte os IPs somente quando necessário para a segurança do sistema.</p>
-
                 <div style="overflow-x:auto">
                     <table>
-                        <thead>
-                            <tr>
-                                <th>Nome</th>
-                                <th>ID</th>
-                                <th>IP</th>
-                                <th>Data</th>
-                                <th>Ação</th>
-                            </tr>
-                        </thead>
+                        <thead><tr>
+                            <th>Nome</th><th>ID</th><th>IP</th><th>Data</th><th>Ação</th>
+                        </tr></thead>
                         <tbody>
                             ${linhasUsuarios || '<tr><td colspan="5">Nenhum usuário encontrado.</td></tr>'}
                         </tbody>
@@ -684,19 +603,11 @@ app.get('/admin', exigirAdmin, async (req, res) => {
 
             <section class="card">
                 <h2>Usuários banidos</h2>
-
                 <div style="overflow-x:auto">
                     <table>
-                        <thead>
-                            <tr>
-                                <th>Nome</th>
-                                <th>ID</th>
-                                <th>IP</th>
-                                <th>Motivo</th>
-                                <th>Data</th>
-                                <th>Ação</th>
-                            </tr>
-                        </thead>
+                        <thead><tr>
+                            <th>Nome</th><th>ID</th><th>IP</th><th>Motivo</th><th>Data</th><th>Ação</th>
+                        </tr></thead>
                         <tbody>
                             ${linhasBanidos || '<tr><td colspan="6">Nenhum banimento.</td></tr>'}
                         </tbody>
@@ -709,12 +620,10 @@ app.get('/admin', exigirAdmin, async (req, res) => {
     } catch (erro) {
         console.error('Erro no painel:', erro);
 
-        res.status(500).send(
-            pagina(
-                'Erro',
-                '<div class="card"><h2>Erro ao abrir o painel</h2></div>'
-            )
-        );
+        res.status(500).send(pagina(
+            'Erro',
+            '<div class="card"><h2>Erro ao abrir o painel</h2></div>'
+        ));
     }
 });
 
@@ -730,16 +639,13 @@ app.post('/admin/banir', exigirAdmin, async (req, res) => {
     const reason = String(req.body.reason || '').trim().slice(0, 300);
 
     if (!/^\d{17,20}$/.test(discordId) || !reason) {
-        return res.status(400).send(
-            pagina(
-                'Dados inválidos',
-                '<div class="card"><h2>Dados inválidos</h2><a href="/admin">Voltar</a></div>'
-            )
-        );
+        return res.status(400).send(pagina(
+            'Dados inválidos',
+            '<div class="card"><h2>Dados inválidos</h2><a href="/admin">Voltar</a></div>'
+        ));
     }
 
     try {
-        // O IP é consultado no banco, não confiamos no formulário.
         const consulta = await pool.query(
             `SELECT ip_address
              FROM verified_users
@@ -774,17 +680,15 @@ app.post('/admin/banir', exigirAdmin, async (req, res) => {
     } catch (erro) {
         console.error('Erro ao banir:', erro);
 
-        res.status(500).send(
-            pagina(
-                'Erro',
-                '<div class="card"><h2>Não foi possível banir.</h2><a href="/admin">Voltar</a></div>'
-            )
-        );
+        res.status(500).send(pagina(
+            'Erro',
+            '<div class="card"><h2>Não foi possível banir.</h2><a href="/admin">Voltar</a></div>'
+        ));
     }
 });
 
 // ======================================
-// DESBANIR PELO PAINEL
+// DESBANIR PELO PAINEL — CORRIGIDO
 // ======================================
 
 app.post('/admin/desbanir', exigirAdmin, async (req, res) => {
@@ -797,17 +701,58 @@ app.post('/admin/desbanir', exigirAdmin, async (req, res) => {
     }
 
     try {
-        // Remove somente o banimento da conta selecionada.
+        if (
+            !DISCORD_BOT_TOKEN ||
+            !/^\d{17,20}$/.test(DISCORD_GUILD_ID || '')
+        ) {
+            return res.status(503).send(pagina(
+                'Configuração necessária',
+                '<div class="card"><h2>Unban não configurado</h2><p>Adicione DISCORD_BOT_TOKEN e DISCORD_GUILD_ID nas variáveis de ambiente do Render. O registro de banimento foi mantido.</p><a href="/admin">Voltar</a></div>'
+            ));
+        }
+
+        // Primeiro remove o banimento real do servidor Discord.
+        const resposta = await fetch(
+            `https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/bans/${discordId}`,
+            {
+                method: 'DELETE',
+                headers: {
+                    Authorization: `Bot ${DISCORD_BOT_TOKEN}`
+                }
+            }
+        );
+
+        // 204 significa que o Discord retirou o banimento.
+        // 404 significa que a conta não estava banida no Discord.
+        if (!resposta.ok && resposta.status !== 404) {
+            const detalhe = await resposta.text().catch(() => '');
+
+            console.error(
+                'Erro no unban do Discord:',
+                resposta.status,
+                detalhe
+            );
+
+            return res.status(502).send(pagina(
+                'Falha no unban',
+                `<div class="card"><h2>O Discord não permitiu desbanir.</h2><p>Código retornado: ${resposta.status}.</p><p>Confira o token, o ID do servidor e a permissão Banir membros do bot.</p><a href="/admin">Voltar</a></div>`
+            ));
+        }
+
+        // Só apaga o registro do site depois da resposta do Discord.
         await pool.query(
             'DELETE FROM user_bans WHERE discord_id = $1',
             [discordId]
         );
 
-        res.redirect('/admin');
+        return res.redirect('/admin');
     } catch (erro) {
         console.error('Erro ao desbanir:', erro);
 
-        res.status(500).send('Não foi possível desbanir.');
+        return res.status(500).send(pagina(
+            'Erro',
+            '<div class="card"><h2>Não foi possível concluir o unban.</h2><p>O registro do site foi mantido. Tente novamente.</p><a href="/admin">Voltar</a></div>'
+        ));
     }
 });
 
@@ -833,10 +778,6 @@ prepararBanco()
         });
     })
     .catch(erro => {
-        console.error(
-            'Não foi possível preparar o banco:',
-            erro
-        );
-
+        console.error('Não foi possível preparar o banco:', erro);
         process.exit(1);
     });
