@@ -34,10 +34,12 @@ if (
 }
 
 app.set('trust proxy', 1);
+
 app.use(express.urlencoded({
     extended: false,
     limit: '20kb'
 }));
+
 app.use(express.json({
     limit: '20kb'
 }));
@@ -278,8 +280,6 @@ app.post('/api/ban', async (req, res) => {
             });
         }
 
-        // Busca o IP já registrado durante a verificação.
-        // O bot não pode escolher ou enviar um IP arbitrário.
         const consulta = await pool.query(
             `SELECT username, ip_address
              FROM verified_users
@@ -301,7 +301,6 @@ app.post('/api/ban', async (req, res) => {
             ? verificado.ip_address
             : '';
 
-        // Cria ou atualiza o registro de banimento.
         await pool.query(
             `INSERT INTO user_bans
                 (discord_id, username, ip_address,
@@ -360,6 +359,7 @@ app.get('/', (req, res) => {
             <p>Entre com sua conta do Discord para iniciar a verificação do servidor.</p>
             ${conta}
         </section>
+
         <section class="card">
             <h2>🔒 Aviso de privacidade</h2>
             <p>Ao continuar, o site recebe seu identificador e nome público do Discord. Para segurança e prevenção de abusos, também registra o endereço IP da conexão e a data da verificação.</p>
@@ -510,8 +510,16 @@ app.get('/verificar', async (req, res) => {
     const ip = obterIp(req);
 
     try {
+        // CORREÇÃO:
+        // Verifica o banimento somente pelo ID da conta Discord.
+        // Não bloqueia uma conta apenas porque compartilha um IP
+        // com outra conta banida.
+
         const banPorId = await pool.query(
-            'SELECT discord_id FROM user_bans WHERE discord_id = $1',
+            `SELECT discord_id
+             FROM user_bans
+             WHERE discord_id = $1
+             LIMIT 1`,
             [usuario.id]
         );
 
@@ -523,32 +531,13 @@ app.get('/verificar', async (req, res) => {
                         <h2>⛔ Verificação bloqueada</h2>
                         <p>Esta conta está banida do sistema de verificação.</p>
                         <p>Se você acredita que isso é um erro, entre em contato com a equipe administrativa.</p>
+                        <a href="/">Voltar</a>
                     </section>`
                 )
             );
         }
 
-        const banPorIp = await pool.query(
-            `SELECT discord_id FROM user_bans
-             WHERE ip_address = $1
-             AND ip_address <> ''
-             LIMIT 1`,
-            [ip]
-        );
-
-        if (banPorIp.rowCount > 0) {
-            return res.status(403).send(
-                pagina(
-                    'Revisão necessária',
-                    `<section class="card">
-                        <h2>🔎 Verificação precisa de revisão</h2>
-                        <p>A conexão corresponde a um endereço IP associado a um banimento anterior.</p>
-                        <p>Como várias pessoas podem compartilhar um IP, a equipe deverá analisar o caso antes de decidir.</p>
-                    </section>`
-                )
-            );
-        }
-
+        // Conta não banida: registra ou atualiza a verificação.
         await pool.query(
             `INSERT INTO verified_users
                 (discord_id, username, avatar, ip_address, verified_at)
@@ -595,6 +584,7 @@ app.get('/verificar', async (req, res) => {
 app.get('/admin', exigirAdmin, async (req, res) => {
     try {
         const csrf = gerarCsrf(req);
+
         const busca = String(req.query.q || '')
             .trim()
             .slice(0, 100);
@@ -660,22 +650,29 @@ app.get('/admin', exigirAdmin, async (req, res) => {
             <section class="card">
                 <h2>🔐 Painel administrativo</h2>
                 <p>Administrador: ${escapar(req.session.usuario.username)}</p>
+
                 <form method="GET" action="/admin">
                     <label>Pesquisar por nome ou ID do Discord</label>
                     <input name="q" value="${escapar(busca)}" placeholder="Nome ou ID">
                     <button class="button" type="submit">Pesquisar</button>
                 </form>
+
                 <p class="small">Exibindo no máximo 100 registros por lista.</p>
             </section>
 
             <section class="card">
                 <h2>Usuários verificados</h2>
                 <p class="small">Consulte os IPs somente quando necessário para a segurança do sistema.</p>
+
                 <div style="overflow-x:auto">
                     <table>
                         <thead>
                             <tr>
-                                <th>Nome</th><th>ID</th><th>IP</th><th>Data</th><th>Ação</th>
+                                <th>Nome</th>
+                                <th>ID</th>
+                                <th>IP</th>
+                                <th>Data</th>
+                                <th>Ação</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -687,11 +684,17 @@ app.get('/admin', exigirAdmin, async (req, res) => {
 
             <section class="card">
                 <h2>Usuários banidos</h2>
+
                 <div style="overflow-x:auto">
                     <table>
                         <thead>
                             <tr>
-                                <th>Nome</th><th>ID</th><th>IP</th><th>Motivo</th><th>Data</th><th>Ação</th>
+                                <th>Nome</th>
+                                <th>ID</th>
+                                <th>IP</th>
+                                <th>Motivo</th>
+                                <th>Data</th>
+                                <th>Ação</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -724,7 +727,6 @@ app.post('/admin/banir', exigirAdmin, async (req, res) => {
 
     const discordId = String(req.body.discord_id || '').trim();
     const username = String(req.body.username || '').slice(0, 100);
-    const ip = String(req.body.ip_address || '').slice(0, 100);
     const reason = String(req.body.reason || '').trim().slice(0, 300);
 
     if (!/^\d{17,20}$/.test(discordId) || !reason) {
@@ -737,10 +739,12 @@ app.post('/admin/banir', exigirAdmin, async (req, res) => {
     }
 
     try {
-        // Não confia no IP enviado pelo formulário.
+        // O IP é consultado no banco, não confiamos no formulário.
         const consulta = await pool.query(
-            `SELECT ip_address FROM verified_users
-             WHERE discord_id = $1 LIMIT 1`,
+            `SELECT ip_address
+             FROM verified_users
+             WHERE discord_id = $1
+             LIMIT 1`,
             [discordId]
         );
 
@@ -793,6 +797,7 @@ app.post('/admin/desbanir', exigirAdmin, async (req, res) => {
     }
 
     try {
+        // Remove somente o banimento da conta selecionada.
         await pool.query(
             'DELETE FROM user_bans WHERE discord_id = $1',
             [discordId]
@@ -832,5 +837,6 @@ prepararBanco()
             'Não foi possível preparar o banco:',
             erro
         );
+
         process.exit(1);
     });
