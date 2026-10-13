@@ -1,3 +1,4 @@
+
 'use strict';
 
 const express = require('express');
@@ -251,7 +252,17 @@ async function verificarIpLogs(ip) {
         }
     );
 
+    // ALTERAÇÃO: registrar a resposta real do IPLogs
+    // para descobrirmos por que a API está retornando erro.
     if (!resposta.ok) {
+        const detalhe = await resposta.text().catch(() => '');
+
+        console.error(
+            'Erro detalhado do IPLogs:',
+            resposta.status,
+            detalhe.slice(0, 1500)
+        );
+
         throw new Error(
             `IPLogs respondeu com HTTP ${resposta.status}.`
         );
