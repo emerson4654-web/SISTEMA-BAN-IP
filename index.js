@@ -14,7 +14,6 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const BAN_API_SECRET = process.env.BAN_API_SECRET;
-const ANTIVPN_API_KEY = process.env.ANTIVPN_API_KEY;
 
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
@@ -100,13 +99,12 @@ async function prepararBanco() {
     `);
 
     await pool.query(`
-        CREATE TABLE IF NOT EXISTS vpn_checks (
+        CREATE TABLE IF NOT EXISTS country_checks (
             id BIGSERIAL PRIMARY KEY,
             discord_id TEXT NOT NULL,
             ip_address TEXT NOT NULL,
-            verdict TEXT NOT NULL,
-            score DOUBLE PRECISION,
-            blocked BOOLEAN NOT NULL,
+            country_code TEXT NOT NULL,
+            allowed BOOLEAN NOT NULL,
             checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     `);
@@ -223,10 +221,10 @@ function obterIp(req) {
 }
 
 // ======================================
-// ANTIVPN — VPN / PROXY / TOR
+// LOCALIZAÇÃO DO IP — SOMENTE BRASIL
 // ======================================
 
-async function verificarVPN(ip) {
+async function verificarPais(ip) {
     const ipLimpo = String(ip || '').trim();
 
     if (
@@ -241,27 +239,18 @@ async function verificarVPN(ip) {
         );
     }
 
-    if (!ANTIVPN_API_KEY) {
-        throw new Error(
-            'Configure a variável ANTIVPN_API_KEY no Render.'
-        );
-    }
-
     const resposta = await fetch(
-        `https://api.antivpn.io/v2/check?ip=${encodeURIComponent(ipLimpo)}`,
+        `https://ipwho.is/${encodeURIComponent(ipLimpo)}`,
         {
             method: 'GET',
-            headers: {
-                Authorization: `Bearer ${ANTIVPN_API_KEY}`,
-                Accept: 'application/json'
-            },
+            headers: { Accept: 'application/json' },
             signal: AbortSignal.timeout(10000)
         }
     );
 
     if (!resposta.ok) {
         throw new Error(
-            `AntiVPN respondeu com HTTP ${resposta.status}.`
+            `O serviço de localização respondeu com HTTP ${resposta.status}.`
         );
     }
 
@@ -269,25 +258,17 @@ async function verificarVPN(ip) {
 
     if (
         dados.success !== true ||
-        typeof dados.proxy !== 'boolean'
+        typeof dados.country_code !== 'string'
     ) {
         throw new Error(
-            'A API AntiVPN retornou uma resposta inválida.'
+            'O serviço de localização não conseguiu identificar o país deste IP.'
         );
     }
 
     return {
-        bloqueado: dados.proxy === true,
-        provider: String(
-            dados.details?.provider ||
-            (dados.proxy
-                ? 'VPN/proxy detectado'
-                : 'Conexão não sinalizada')
-        ),
-        asn: String(dados.details?.asn || '—'),
-        score: typeof dados.score === 'number'
-            ? dados.score
-            : null
+        permitido: dados.country_code.toUpperCase() === 'BR',
+        codigoPais: dados.country_code.toUpperCase(),
+        pais: String(dados.country || 'País não identificado')
     };
 }
 
@@ -582,7 +563,7 @@ app.get('/auth/callback', async (req, res) => {
 });
 
 // ======================================
-// VERIFICAÇÃO ANTIVPN + CARGO
+// VERIFICAÇÃO DE PAÍS + ENTREGA DO CARGO
 // ======================================
 
 app.get('/verificar', async (req, res) => {
@@ -605,69 +586,45 @@ app.get('/verificar', async (req, res) => {
         if (banPorId.rowCount > 0) {
             return res.status(403).send(pagina(
                 'Verificação bloqueada',
-                `<section class="card">
-                    <h2>⛔ Verificação bloqueada</h2>
-                    <p>Esta conta está banida do sistema de verificação.</p>
-                    <p>Se acredita que isso é um erro, entre em contato com a equipe administrativa.</p>
-                    <a href="/">Voltar</a>
-                </section>`
+                '<div class="card"><h2>⛔ Verificação bloqueada</h2><p>Esta conta está banida do sistema de verificação.</p><a href="/">Voltar</a></div>'
             ));
         }
 
-        let resultadoVPN;
+        let resultadoPais;
 
         try {
-            resultadoVPN = await verificarVPN(ip);
-        } catch (erroVPN) {
+            resultadoPais = await verificarPais(ip);
+        } catch (erroPais) {
             console.error(
-                'Falha na verificação AntiVPN:',
-                erroVPN.message
+                'Falha ao localizar o país do IP:',
+                erroPais.message
             );
 
             return res.status(503).send(pagina(
                 'Verificação indisponível',
-                `<section class="card">
-                    <h2>⚠️ Não foi possível verificar sua conexão</h2>
-                    <p>O serviço AntiVPN está indisponível ou não conseguiu analisar seu IP público.</p>
-                    <p>Tente novamente em alguns instantes. Seu cargo não foi alterado.</p>
-                    <a href="/verificar">Tentar novamente</a>
-                    <a class="secondary" href="/">Voltar</a>
-                </section>`
+                '<div class="card"><h2>⚠️ Não foi possível verificar seu país</h2><p>O serviço de localização de IP está indisponível ou não conseguiu analisar sua conexão.</p><p>Tente novamente em alguns instantes. Seu cargo não foi alterado.</p><a href="/verificar">Tentar novamente</a> <a class="secondary" href="/">Voltar</a></div>'
             ));
         }
 
-        const bloqueadoPorVPN = resultadoVPN.bloqueado;
-        const vereditoVPN = bloqueadoPorVPN
-            ? 'VPN/PROXY/TOR'
-            : 'NORMAL';
-
         await pool.query(
-            `INSERT INTO vpn_checks
-                (discord_id, ip_address, verdict, score, blocked)
-             VALUES ($1, $2, $3, $4, $5)`,
+            `INSERT INTO country_checks
+                (discord_id, ip_address, country_code, allowed)
+             VALUES ($1, $2, $3, $4)`,
             [
                 usuario.id,
                 ip,
-                vereditoVPN,
-                resultadoVPN.score,
-                bloqueadoPorVPN
+                resultadoPais.codigoPais,
+                resultadoPais.permitido
             ]
         );
 
-        if (bloqueadoPorVPN) {
-            console.warn(
-                `Acesso bloqueado por AntiVPN: Discord ${usuario.id}; ` +
-                `provider=${resultadoVPN.provider}; asn=${resultadoVPN.asn}`
-            );
-
+        if (!resultadoPais.permitido) {
             return res.status(403).send(pagina(
-                'VPN ou proxy detectado',
+                'Acesso permitido somente ao Brasil',
                 `<section class="card">
-                    <h2>🛡️ VPN, proxy ou Tor detectado</h2>
-                    <p>A API AntiVPN sinalizou esta conexão como VPN/proxy.</p>
-                    <p><strong>Provedor identificado:</strong> ${escapar(resultadoVPN.provider)}</p>
-                    <p><strong>ASN:</strong> ${escapar(resultadoVPN.asn)}</p>
-                    <p>Desative a VPN ou o proxy e tente novamente. Seu cargo não foi alterado.</p>
+                    <h2>🇧🇷 Acesso permitido somente do Brasil</h2>
+                    <p>O país identificado para esta conexão foi: <strong>${escapar(resultadoPais.pais)}</strong>.</p>
+                    <p>Somente conexões identificadas como Brasil podem concluir a verificação. Seu cargo não foi alterado.</p>
                     <a href="/">Voltar</a>
                 </section>`
             ));
@@ -685,7 +642,7 @@ app.get('/verificar', async (req, res) => {
                 'Não foi possível entregar o cargo',
                 `<section class="card">
                     <h2>⚠️ Verificação ainda não concluída</h2>
-                    <p>Sua conexão passou pela verificação AntiVPN, mas o Discord não confirmou a entrega do cargo.</p>
+                    <p>Sua conexão foi identificada como Brasil, mas o Discord não confirmou a entrega do cargo.</p>
                     <p>${escapar(erroCargo.message)}</p>
                     <p>Confira se você está no servidor correto e tente novamente.</p>
                     <a href="/verificar">Tentar novamente</a>
@@ -715,7 +672,7 @@ app.get('/verificar', async (req, res) => {
             <section class="card">
                 <h2>✅ Verificação concluída!</h2>
                 <p>Conta Discord: <strong>${escapar(usuario.username)}</strong></p>
-                <p>Sua conexão passou pela verificação AntiVPN e o cargo de verificado foi solicitado ao Discord.</p>
+                <p>Seu país foi identificado como Brasil e o cargo de verificado foi entregue.</p>
                 <p class="small">ID da conta: ${escapar(usuario.id)}</p>
                 <a href="/">Voltar à página inicial</a>
             </section>
@@ -747,19 +704,22 @@ app.get('/admin', exigirAdmin, async (req, res) => {
             usuarios = await pool.query(
                 `SELECT * FROM verified_users
                  WHERE discord_id = $1 OR username ILIKE $2
-                 ORDER BY verified_at DESC LIMIT 100`,
+                 ORDER BY verified_at DESC
+                 LIMIT 100`,
                 [busca, `%${busca}%`]
             );
         } else {
             usuarios = await pool.query(
                 `SELECT * FROM verified_users
-                 ORDER BY verified_at DESC LIMIT 100`
+                 ORDER BY verified_at DESC
+                 LIMIT 100`
             );
         }
 
         const banidos = await pool.query(
             `SELECT * FROM user_bans
-             ORDER BY banned_at DESC LIMIT 100`
+             ORDER BY banned_at DESC
+             LIMIT 100`
         );
 
         const linhasUsuarios = usuarios.rows.map(u => `
@@ -798,8 +758,8 @@ app.get('/admin', exigirAdmin, async (req, res) => {
         `).join('');
 
         const checagens = await pool.query(
-            `SELECT discord_id, ip_address, verdict, score, blocked, checked_at
-             FROM vpn_checks
+            `SELECT discord_id, ip_address, country_code, allowed, checked_at
+             FROM country_checks
              ORDER BY checked_at DESC
              LIMIT 50`
         );
@@ -808,9 +768,8 @@ app.get('/admin', exigirAdmin, async (req, res) => {
             <tr>
                 <td>${escapar(c.discord_id)}</td>
                 <td>${escapar(c.ip_address)}</td>
-                <td>${escapar(c.verdict)}</td>
-                <td>${escapar(c.score ?? '—')}</td>
-                <td>${c.blocked ? 'Bloqueado' : 'Liberado'}</td>
+                <td>${escapar(c.country_code)}</td>
+                <td>${c.allowed ? 'Permitido' : 'Bloqueado'}</td>
                 <td>${escapar(new Date(c.checked_at).toLocaleString('pt-BR'))}</td>
             </tr>
         `).join('');
@@ -856,14 +815,14 @@ app.get('/admin', exigirAdmin, async (req, res) => {
             </section>
 
             <section class="card">
-                <h2>🛡️ Registros de verificação AntiVPN</h2>
+                <h2>🇧🇷 Registros de verificação por país</h2>
                 <div style="overflow-x:auto">
                     <table>
                         <thead><tr>
-                            <th>ID Discord</th><th>IP</th><th>Veredito</th><th>Pontuação</th><th>Resultado</th><th>Data</th>
+                            <th>ID Discord</th><th>IP</th><th>País</th><th>Resultado</th><th>Data</th>
                         </tr></thead>
                         <tbody>
-                            ${linhasChecagens || '<tr><td colspan="6">Nenhuma checagem registrada.</td></tr>'}
+                            ${linhasChecagens || '<tr><td colspan="5">Nenhuma checagem registrada.</td></tr>'}
                         </tbody>
                     </table>
                 </div>
