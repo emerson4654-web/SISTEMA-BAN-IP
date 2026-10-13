@@ -14,6 +14,7 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const BAN_API_SECRET = process.env.BAN_API_SECRET;
+const ANTIVPN_API_KEY = process.env.ANTIVPN_API_KEY;
 
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
@@ -222,10 +223,10 @@ function obterIp(req) {
 }
 
 // ======================================
-// VERIFICAÇÃO DE PAÍS — SOMENTE BRASIL
+// ANTIVPN — VPN / PROXY / TOR
 // ======================================
 
-async function verificarPaisBrasil(ip) {
+async function verificarVPN(ip) {
     const ipLimpo = String(ip || '').trim();
 
     if (
@@ -240,14 +241,27 @@ async function verificarPaisBrasil(ip) {
         );
     }
 
+    if (!ANTIVPN_API_KEY) {
+        throw new Error(
+            'Configure a variável ANTIVPN_API_KEY no Render.'
+        );
+    }
+
     const resposta = await fetch(
-        `https://ipwho.is/${encodeURIComponent(ipLimpo)}`,
-        { signal: AbortSignal.timeout(10000) }
+        `https://api.antivpn.io/v2/check?ip=${encodeURIComponent(ipLimpo)}`,
+        {
+            method: 'GET',
+            headers: {
+                Authorization: `Bearer ${ANTIVPN_API_KEY}`,
+                Accept: 'application/json'
+            },
+            signal: AbortSignal.timeout(10000)
+        }
     );
 
     if (!resposta.ok) {
         throw new Error(
-            `Serviço de localização respondeu com HTTP ${resposta.status}.`
+            `AntiVPN respondeu com HTTP ${resposta.status}.`
         );
     }
 
@@ -255,17 +269,25 @@ async function verificarPaisBrasil(ip) {
 
     if (
         dados.success !== true ||
-        typeof dados.country_code !== 'string'
+        typeof dados.proxy !== 'boolean'
     ) {
-        throw new Error('Não foi possível descobrir o país deste IP.');
+        throw new Error(
+            'A API AntiVPN retornou uma resposta inválida.'
+        );
     }
 
-    const codigoPais = dados.country_code.toUpperCase();
-
     return {
-        permitido: codigoPais === 'BR',
-        countryCode: codigoPais,
-        country: String(dados.country || codigoPais)
+        bloqueado: dados.proxy === true,
+        provider: String(
+            dados.details?.provider ||
+            (dados.proxy
+                ? 'VPN/proxy detectado'
+                : 'Conexão não sinalizada')
+        ),
+        asn: String(dados.details?.asn || '—'),
+        score: typeof dados.score === 'number'
+            ? dados.score
+            : null
     };
 }
 
@@ -560,7 +582,7 @@ app.get('/auth/callback', async (req, res) => {
 });
 
 // ======================================
-// VERIFICAÇÃO DE PAÍS + CARGO
+// VERIFICAÇÃO ANTIVPN + CARGO
 // ======================================
 
 app.get('/verificar', async (req, res) => {
@@ -592,22 +614,21 @@ app.get('/verificar', async (req, res) => {
             ));
         }
 
-        // Verifica somente o país. Não verifica VPN, proxy ou Tor.
-        let resultadoPais;
+        let resultadoVPN;
 
         try {
-            resultadoPais = await verificarPaisBrasil(ip);
-        } catch (erroPais) {
+            resultadoVPN = await verificarVPN(ip);
+        } catch (erroVPN) {
             console.error(
-                'Falha na localização do IP:',
-                erroPais.message
+                'Falha na verificação AntiVPN:',
+                erroVPN.message
             );
 
             return res.status(503).send(pagina(
                 'Verificação indisponível',
                 `<section class="card">
-                    <h2>⚠️ Não foi possível identificar seu país</h2>
-                    <p>O serviço de localização está indisponível ou não conseguiu identificar seu IP público.</p>
+                    <h2>⚠️ Não foi possível verificar sua conexão</h2>
+                    <p>O serviço AntiVPN está indisponível ou não conseguiu analisar seu IP público.</p>
                     <p>Tente novamente em alguns instantes. Seu cargo não foi alterado.</p>
                     <a href="/verificar">Tentar novamente</a>
                     <a class="secondary" href="/">Voltar</a>
@@ -615,7 +636,10 @@ app.get('/verificar', async (req, res) => {
             ));
         }
 
-        const bloqueadoPorPais = !resultadoPais.permitido;
+        const bloqueadoPorVPN = resultadoVPN.bloqueado;
+        const vereditoVPN = bloqueadoPorVPN
+            ? 'VPN/PROXY/TOR'
+            : 'NORMAL';
 
         await pool.query(
             `INSERT INTO vpn_checks
@@ -624,30 +648,31 @@ app.get('/verificar', async (req, res) => {
             [
                 usuario.id,
                 ip,
-                resultadoPais.countryCode,
-                null,
-                bloqueadoPorPais
+                vereditoVPN,
+                resultadoVPN.score,
+                bloqueadoPorVPN
             ]
         );
 
-        if (bloqueadoPorPais) {
+        if (bloqueadoPorVPN) {
             console.warn(
-                `Acesso bloqueado por país: Discord ${usuario.id}; ` +
-                `país=${resultadoPais.countryCode}`
+                `Acesso bloqueado por AntiVPN: Discord ${usuario.id}; ` +
+                `provider=${resultadoVPN.provider}; asn=${resultadoVPN.asn}`
             );
 
             return res.status(403).send(pagina(
-                'Acesso permitido somente no Brasil',
+                'VPN ou proxy detectado',
                 `<section class="card">
-                    <h2>🇧🇷 Acesso restrito ao Brasil</h2>
-                    <p>O país identificado para sua conexão foi <strong>${escapar(resultadoPais.country)}</strong>.</p>
-                    <p>Este sistema de verificação só permite conexões identificadas como brasileiras.</p>
+                    <h2>🛡️ VPN, proxy ou Tor detectado</h2>
+                    <p>A API AntiVPN sinalizou esta conexão como VPN/proxy.</p>
+                    <p><strong>Provedor identificado:</strong> ${escapar(resultadoVPN.provider)}</p>
+                    <p><strong>ASN:</strong> ${escapar(resultadoVPN.asn)}</p>
+                    <p>Desative a VPN ou o proxy e tente novamente. Seu cargo não foi alterado.</p>
                     <a href="/">Voltar</a>
                 </section>`
             ));
         }
 
-        // Entrega o cargo após confirmar que o país é o Brasil.
         try {
             await atribuirCargoVerificado(usuario.id);
         } catch (erroCargo) {
@@ -660,7 +685,7 @@ app.get('/verificar', async (req, res) => {
                 'Não foi possível entregar o cargo',
                 `<section class="card">
                     <h2>⚠️ Verificação ainda não concluída</h2>
-                    <p>Sua conexão passou pela verificação de país, mas o Discord não confirmou a entrega do cargo.</p>
+                    <p>Sua conexão passou pela verificação AntiVPN, mas o Discord não confirmou a entrega do cargo.</p>
                     <p>${escapar(erroCargo.message)}</p>
                     <p>Confira se você está no servidor correto e tente novamente.</p>
                     <a href="/verificar">Tentar novamente</a>
@@ -690,7 +715,7 @@ app.get('/verificar', async (req, res) => {
             <section class="card">
                 <h2>✅ Verificação concluída!</h2>
                 <p>Conta Discord: <strong>${escapar(usuario.username)}</strong></p>
-                <p>Seu país foi identificado como Brasil e o cargo de verificado foi solicitado ao Discord.</p>
+                <p>Sua conexão passou pela verificação AntiVPN e o cargo de verificado foi solicitado ao Discord.</p>
                 <p class="small">ID da conta: ${escapar(usuario.id)}</p>
                 <a href="/">Voltar à página inicial</a>
             </section>
@@ -831,11 +856,11 @@ app.get('/admin', exigirAdmin, async (req, res) => {
             </section>
 
             <section class="card">
-                <h2>🇧🇷 Registros de verificação por país</h2>
+                <h2>🛡️ Registros de verificação AntiVPN</h2>
                 <div style="overflow-x:auto">
                     <table>
                         <thead><tr>
-                            <th>ID Discord</th><th>IP</th><th>País</th><th>Pontuação</th><th>Resultado</th><th>Data</th>
+                            <th>ID Discord</th><th>IP</th><th>Veredito</th><th>Pontuação</th><th>Resultado</th><th>Data</th>
                         </tr></thead>
                         <tbody>
                             ${linhasChecagens || '<tr><td colspan="6">Nenhuma checagem registrada.</td></tr>'}
