@@ -14,6 +14,7 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const CLIENT_SECRET = process.env.DISCORD_CLIENT_SECRET;
 const SESSION_SECRET = process.env.SESSION_SECRET;
 const BAN_API_SECRET = process.env.BAN_API_SECRET;
+const LOGS_API_SECRET = process.env.LOGS_API_SECRET;
 
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
@@ -53,6 +54,10 @@ const pool = new Pool({
     ssl: process.env.DATABASE_SSL === 'false'
         ? false
         : { rejectUnauthorized: false }
+});
+
+pool.on('error', erro => {
+    console.error('Erro inesperado no PostgreSQL:', erro);
 });
 
 app.use(session({
@@ -98,6 +103,25 @@ async function prepararBanco() {
         )
     `);
 
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS site_logs (
+            id BIGSERIAL PRIMARY KEY,
+            source TEXT NOT NULL DEFAULT 'bot',
+            action TEXT NOT NULL,
+            user_id TEXT NOT NULL DEFAULT '',
+            username TEXT NOT NULL DEFAULT '',
+            details TEXT NOT NULL DEFAULT '',
+            guild_id TEXT NOT NULL DEFAULT '',
+            channel_id TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_site_logs_created_at
+        ON site_logs (created_at DESC)
+    `);
+
     console.log('Banco de dados preparado.');
 }
 
@@ -127,11 +151,11 @@ function pagina(titulo, conteudo) {
 body{margin:0;background:#101319;color:#f4f4f5;font-family:Arial,sans-serif}
 header{padding:22px 16px;text-align:center;background:#171b24;border-bottom:1px solid #303644}
 header h1{margin:0;font-size:22px}
-main{width:min(1000px,94%);margin:32px auto}
+main{width:min(1100px,94%);margin:32px auto}
 .card{background:#1b202b;border:1px solid #343b4a;border-radius:14px;padding:22px;margin-bottom:18px}
 h2{margin-top:0}
 p{line-height:1.6;color:#d1d5db}
-a,.button{display:inline-block;background:#5865f2;color:white;text-decoration:none;border:0;border-radius:8px;padding:12px 16px;font-weight:bold;cursor:pointer}
+a,.button{display:inline-block;background:#5865f2;color:white;text-decoration:none;border:0;border-radius:8px;padding:12px 16px;font-weight:bold;cursor:pointer;margin:3px 0}
 .secondary{background:#343b4a}
 .danger{background:#b42332}
 input,textarea{width:100%;padding:11px;margin:7px 0 14px;background:#101319;color:white;border:1px solid #454d5e;border-radius:7px}
@@ -209,6 +233,21 @@ function obterIp(req) {
     ).replace(/^::ffff:/, '').slice(0, 100);
 }
 
+function segredoValido(req, segredo) {
+    if (!segredo) return false;
+
+    const authorization = req.get('authorization') || '';
+    const recebido = authorization.startsWith('Bearer ')
+        ? authorization.slice(7)
+        : '';
+
+    const a = Buffer.from(segredo);
+    const b = Buffer.from(recebido);
+
+    return a.length === b.length &&
+        crypto.timingSafeEqual(a, b);
+}
+
 // ======================================
 // ENTREGA DO CARGO VERIFICADO
 // ======================================
@@ -263,35 +302,17 @@ async function atribuirCargoVerificado(discordId) {
 }
 
 // ======================================
-// API DE BANIMENTO
+// API DE BANIMENTO DO BOT
 // ======================================
 
 app.post('/api/ban', async (req, res) => {
     try {
-        if (!BAN_API_SECRET) {
-            return res.status(503).json({
+        if (!segredoValido(req, BAN_API_SECRET)) {
+            return res.status(BAN_API_SECRET ? 401 : 503).json({
                 success: false,
-                error: 'API de banimento não configurada.'
-            });
-        }
-
-        const authorization = req.get('authorization') || '';
-        const prefix = 'Bearer ';
-
-        const chaveRecebida = authorization.startsWith(prefix)
-            ? authorization.slice(prefix.length)
-            : '';
-
-        const esperada = Buffer.from(BAN_API_SECRET);
-        const recebida = Buffer.from(chaveRecebida);
-
-        if (
-            recebida.length !== esperada.length ||
-            !crypto.timingSafeEqual(recebida, esperada)
-        ) {
-            return res.status(401).json({
-                success: false,
-                error: 'Não autorizado.'
+                error: BAN_API_SECRET
+                    ? 'Não autorizado.'
+                    : 'API de banimento não configurada.'
             });
         }
 
@@ -353,6 +374,70 @@ app.post('/api/ban', async (req, res) => {
         return res.status(500).json({
             success: false,
             error: 'Não foi possível registrar o banimento.'
+        });
+    }
+});
+
+// ======================================
+// API DE RECEBIMENTO DAS LOGS DO BOT
+// ======================================
+
+app.post('/api/logs', async (req, res) => {
+    try {
+        if (!segredoValido(req, LOGS_API_SECRET)) {
+            return res.status(LOGS_API_SECRET ? 401 : 503).json({
+                success: false,
+                error: LOGS_API_SECRET
+                    ? 'Não autorizado.'
+                    : 'LOGS_API_SECRET não configurada.'
+            });
+        }
+
+        const action = String(req.body.action || '')
+            .trim().slice(0, 100);
+        const userId = String(req.body.user_id || '')
+            .trim().slice(0, 30);
+        const username = String(req.body.username || '')
+            .trim().slice(0, 100);
+        const details = String(req.body.details || '')
+            .trim().slice(0, 2000);
+        const guildId = String(req.body.guild_id || '')
+            .trim().slice(0, 30);
+        const channelId = String(req.body.channel_id || '')
+            .trim().slice(0, 30);
+
+        if (!action) {
+            return res.status(400).json({
+                success: false,
+                error: 'A ação da log é obrigatória.'
+            });
+        }
+
+        await pool.query(
+            `INSERT INTO site_logs
+                (source, action, user_id, username, details,
+                 guild_id, channel_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+            [
+                'bot',
+                action,
+                userId,
+                username,
+                details,
+                guildId,
+                channelId
+            ]
+        );
+
+        return res.status(201).json({
+            success: true
+        });
+    } catch (erro) {
+        console.error('Erro ao receber log do bot:', erro);
+
+        return res.status(500).json({
+            success: false,
+            error: 'Não foi possível salvar a log.'
         });
     }
 });
@@ -534,9 +619,6 @@ app.get('/verificar', async (req, res) => {
             ));
         }
 
-        // Não existe consulta de país, localização ou VPN.
-        // A verificação segue diretamente para a entrega do cargo.
-
         try {
             await atribuirCargoVerificado(usuario.id);
         } catch (erroCargo) {
@@ -673,6 +755,7 @@ app.get('/admin', exigirAdmin, async (req, res) => {
                     <button class="button" type="submit">Pesquisar</button>
                 </form>
                 <p class="small">Exibindo no máximo 100 usuários e 100 banimentos.</p>
+                <a href="/admin/logs">📋 Ver logs do sistema</a>
             </section>
 
             <section class="card">
@@ -711,6 +794,74 @@ app.get('/admin', exigirAdmin, async (req, res) => {
         res.status(500).send(pagina(
             'Erro',
             '<div class="card"><h2>Erro ao abrir o painel</h2><a href="/">Voltar</a></div>'
+        ));
+    }
+});
+
+// ======================================
+// PÁGINA DE LOGS — SOMENTE ADMIN
+// ======================================
+
+app.get('/admin/logs', exigirAdmin, async (req, res) => {
+    try {
+        const resultado = await pool.query(
+            `SELECT id, source, action, user_id, username,
+                    details, guild_id, channel_id, created_at
+             FROM site_logs
+             ORDER BY created_at DESC
+             LIMIT 200`
+        );
+
+        const linhas = resultado.rows.map(log => `
+            <tr>
+                <td>${escapar(new Date(log.created_at).toLocaleString('pt-BR'))}</td>
+                <td>${escapar(log.source)}</td>
+                <td>${escapar(log.action)}</td>
+                <td>${escapar(log.username || 'Não informado')}</td>
+                <td>${escapar(log.user_id || '—')}</td>
+                <td>${escapar(log.details || '—')}</td>
+                <td>${escapar(log.guild_id || '—')}</td>
+                <td>${escapar(log.channel_id || '—')}</td>
+            </tr>
+        `).join('');
+
+        return res.send(pagina('Logs do sistema', `
+            <section class="card">
+                <h2>📋 Logs do sistema</h2>
+                <p>Últimos ${resultado.rowCount} registros armazenados no PostgreSQL.</p>
+                <p class="small">Máximo de 200 registros, do mais recente para o mais antigo.</p>
+                <a href="/admin">Voltar ao painel</a>
+                <a class="secondary" href="/admin/logs">Atualizar logs</a>
+            </section>
+
+            <section class="card">
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Data</th>
+                                <th>Origem</th>
+                                <th>Ação</th>
+                                <th>Usuário</th>
+                                <th>ID</th>
+                                <th>Detalhes</th>
+                                <th>Servidor</th>
+                                <th>Canal</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${linhas || '<tr><td colspan="8">Nenhuma log registrada ainda. Conecte o bot e envie um evento de teste.</td></tr>'}
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        `));
+    } catch (erro) {
+        console.error('Erro ao consultar logs:', erro);
+
+        return res.status(500).send(pagina(
+            'Erro nas logs',
+            '<div class="card"><h2>Não foi possível carregar as logs.</h2><a href="/admin">Voltar</a></div>'
         ));
     }
 });
