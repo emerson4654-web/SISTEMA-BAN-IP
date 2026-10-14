@@ -122,6 +122,11 @@ async function prepararBanco() {
         ON site_logs (created_at DESC)
     `);
 
+    await pool.query(`
+        CREATE INDEX IF NOT EXISTS idx_user_bans_ip_address
+        ON user_bans (ip_address)
+    `);
+
     console.log('Banco de dados preparado.');
 }
 
@@ -297,6 +302,53 @@ async function atribuirCargoVerificado(discordId) {
 
         throw new Error(
             `O Discord recusou a atribuição do cargo (HTTP ${resposta.status}).`
+        );
+    }
+}
+
+// ======================================
+// BANIR MEMBRO DO SERVIDOR DO DISCORD
+// ======================================
+
+async function banirMembroDiscord(discordId, motivo) {
+    if (
+        !DISCORD_BOT_TOKEN ||
+        !/^\d{17,20}$/.test(DISCORD_GUILD_ID || '')
+    ) {
+        throw new Error(
+            'Configure DISCORD_BOT_TOKEN e DISCORD_GUILD_ID.'
+        );
+    }
+
+    const resposta = await fetch(
+        `https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/bans/${discordId}`,
+        {
+            method: 'PUT',
+            headers: {
+                Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+                'Content-Type': 'application/json',
+                'X-Audit-Log-Reason': encodeURIComponent(
+                    String(motivo).slice(0, 400)
+                )
+            },
+            body: JSON.stringify({
+                delete_message_seconds: 0
+            }),
+            signal: AbortSignal.timeout(10000)
+        }
+    );
+
+    if (!resposta.ok) {
+        const detalhe = await resposta.text().catch(() => '');
+
+        console.error(
+            'Erro ao banir membro do Discord:',
+            resposta.status,
+            detalhe
+        );
+
+        throw new Error(
+            `O Discord recusou o banimento (HTTP ${resposta.status}).`
         );
     }
 }
@@ -592,7 +644,8 @@ app.get('/auth/callback', async (req, res) => {
 
 // ======================================
 // VERIFICAÇÃO DA CONTA
-// SEM VERIFICAÇÃO DE PAÍS OU ANTIVPN
+// SEM VPN OU BLOQUEIO POR PAÍS
+// CHECA IP ASSOCIADO A BANIMENTOS
 // ======================================
 
 app.get('/verificar', async (req, res) => {
@@ -603,7 +656,15 @@ app.get('/verificar', async (req, res) => {
     const usuario = req.session.usuario;
     const ip = obterIp(req);
 
+    const ipValido = Boolean(
+        ip &&
+        ip !== 'desconhecido' &&
+        ip !== '::1' &&
+        ip !== '127.0.0.1'
+    );
+
     try {
+        // Primeiro: verificar banimento da própria conta.
         const banPorId = await pool.query(
             `SELECT discord_id
              FROM user_bans
@@ -613,12 +674,92 @@ app.get('/verificar', async (req, res) => {
         );
 
         if (banPorId.rowCount > 0) {
+            try {
+                await banirMembroDiscord(
+                    usuario.id,
+                    'Conta com banimento registrado no sistema do EB.'
+                );
+            } catch (erroBan) {
+                console.error(
+                    'Falha ao aplicar banimento da conta:',
+                    erroBan.message
+                );
+
+                return res.status(502).send(pagina(
+                    'Banimento pendente',
+                    '<div class="card"><h2>Banimento registrado</h2><p>Não foi possível confirmar o banimento no Discord. Confira as permissões do bot.</p><a href="/">Voltar</a></div>'
+                ));
+            }
+
             return res.status(403).send(pagina(
                 'Verificação bloqueada',
-                '<div class="card"><h2>⛔ Verificação bloqueada</h2><p>Esta conta está banida do sistema de verificação.</p><a href="/">Voltar</a></div>'
+                '<div class="card"><h2>⛔ Acesso bloqueado</h2><p>Esta conta está banida do servidor do Exército Brasileiro.</p><a href="/">Voltar</a></div>'
             ));
         }
 
+        // Segundo: comparar o IP com registros de banimento.
+        // Não consulta país, VPN ou proxy.
+        if (ipValido) {
+            const banPorIp = await pool.query(
+                `SELECT discord_id
+                 FROM user_bans
+                 WHERE ip_address = $1
+                   AND ip_address <> ''
+                   AND ip_address <> 'desconhecido'
+                   AND discord_id <> $2
+                 LIMIT 1`,
+                [ip, usuario.id]
+            );
+
+            if (banPorIp.rowCount > 0) {
+                const motivo =
+                    'Banimento automático: IP associado a um registro de banimento.';
+
+                try {
+                    // Aplicar banimento somente neste servidor Discord.
+                    await banirMembroDiscord(usuario.id, motivo);
+                } catch (erroBan) {
+                    console.error(
+                        'Falha no banimento automático por IP:',
+                        erroBan.message
+                    );
+
+                    return res.status(502).send(pagina(
+                        'Não foi possível concluir',
+                        '<div class="card"><h2>⚠️ Não foi possível concluir o banimento</h2><p>A verificação foi interrompida. Confira as permissões do bot e tente novamente.</p><a href="/">Voltar</a></div>'
+                    ));
+                }
+
+                // Guardar o registro do banimento no site.
+                await pool.query(
+                    `INSERT INTO user_bans
+                        (discord_id, username, ip_address, reason,
+                         banned_by, banned_at)
+                     VALUES ($1, $2, $3, $4, $5, NOW())
+                     ON CONFLICT (discord_id)
+                     DO UPDATE SET
+                        username = EXCLUDED.username,
+                        ip_address = EXCLUDED.ip_address,
+                        reason = EXCLUDED.reason,
+                        banned_by = EXCLUDED.banned_by,
+                        banned_at = NOW()`,
+                    [
+                        usuario.id,
+                        usuario.username,
+                        ip,
+                        motivo,
+                        'SISTEMA_AUTOMATICO'
+                    ]
+                );
+
+                return res.status(403).send(pagina(
+                    'Acesso bloqueado',
+                    '<div class="card"><h2>⛔ Acesso bloqueado</h2><p>Esta conta foi banida do servidor do Exército Brasileiro porque o IP utilizado corresponde a um registro de banimento.</p><p>O cargo de verificado não foi entregue.</p><a href="/">Voltar</a></div>'
+                ));
+            }
+        }
+
+        // Terceiro: entregar o cargo somente após as verificações.
         try {
             await atribuirCargoVerificado(usuario.id);
         } catch (erroCargo) {
@@ -639,6 +780,7 @@ app.get('/verificar', async (req, res) => {
             ));
         }
 
+        // Quarto: registrar a verificação no PostgreSQL.
         await pool.query(
             `INSERT INTO verified_users
                 (discord_id, username, avatar, ip_address, verified_at)
@@ -717,7 +859,7 @@ app.get('/admin', exigirAdmin, async (req, res) => {
                 <td>${escapar(new Date(u.verified_at).toLocaleString('pt-BR'))}</td>
                 <td>
                     <form method="POST" action="/admin/banir">
-                        <input type="hidden" name="csrfToken" value="${csrf}">
+                        <input type="hidden" name="csrfToken" value="${escapar(csrf)}">
                         <input type="hidden" name="discord_id" value="${escapar(u.discord_id)}">
                         <input type="hidden" name="username" value="${escapar(u.username)}">
                         <label>Motivo do banimento</label>
@@ -737,7 +879,7 @@ app.get('/admin', exigirAdmin, async (req, res) => {
                 <td>${escapar(new Date(b.banned_at).toLocaleString('pt-BR'))}</td>
                 <td>
                     <form method="POST" action="/admin/desbanir">
-                        <input type="hidden" name="csrfToken" value="${csrf}">
+                        <input type="hidden" name="csrfToken" value="${escapar(csrf)}">
                         <input type="hidden" name="discord_id" value="${escapar(b.discord_id)}">
                         <button class="button" type="submit">Desbanir</button>
                     </form>
